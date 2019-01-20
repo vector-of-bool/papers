@@ -1,0 +1,512 @@
+<pre class='metadata'>
+Title: A pipeline-rewrite operator for C++
+Shortname: pipeline-rewrite
+Level: 1
+Status: DREAM
+Group: wg21
+Markup Shorthands: markdown yes
+Editor: Colby Pike, vectorofbool@gmail.com, https://vector-of-bool.github.io/
+Abstract: Proposal for a new non-overloadable binary operator ``|>`` with the
+Abstract: intention of making it easy to create composable, functional,
+Abstract: pipeline-style code, as well as libraries that support such a style.
+</pre>
+
+# Revision History # {#revs}
+
+## Revision 0 ## {#revs.0}
+
+Initial version.
+
+
+# Overview # {#overview}
+
+As a preface: Note that this proposal is *very different* from [[p1282r0]]!
+Both this paper and that paper propose a ``|>`` operator, but the proposed
+semantics are not the same.
+
+## Motivation ## {#ovr.motivation}
+
+While the addition of Ranges into the standard brings many great features and
+concepts, the "pipeline" features could use some attention. The current
+incarnation of the pipeline functionality brings a few important drawbacks:
+
+1. The necessary amount of supporting code machinery lends itself to high
+    amounts of complexity, creating a larger maintenance burden on developers
+    who wish to use and write pipeline-style code.
+2. The support machinery can incur large amounts of overhead when inlining
+    and peephole optimizations are not enabled.
+3. The support machinery places additional large burdens on the implementation
+    in that it needs to parse and process large amounts of the support code
+    that is needed to support the syntax.
+
+The goal of the "pipeline-rewrite" operator proposed herein is to solve all of
+the above issues, as well as generalize the concept of "pipeline" code to work
+with arbitrary functions and types, and not just those that must specifically
+request it.
+
+The addition of a "pipeline-rewrite" operator requires no API adjustments to
+any existing or proposed libraries in order to support such an operator.
+
+
+## Pipeline Style ## {#ovr.pipeline}
+
+C++ has object-oriented *features*, but it is not itself an object-oriented
+*language*. This author attributes much of C++'s success to its ability to
+support multiple paradigms simultaneously, lending the benefits of each domain
+to developers when appropriate.
+
+Not being solely object-oriented, and with the benefits of generic programming,
+we have seen the proliferations of generic algorithms being implemented as
+free functions. For example, where many languages have a single type to
+represent a "sequence" of values, C++ permits an unlimited number of "sequence"
+types tailored to the needs of their respective domain, and the generic
+algorithms that operate on them work identically (provided the underlying type
+meets the appropriate guarantees). In classical object-oriented languages, the
+algorithms are attached to the objects themselves. For example:
+
+```js
+// Some JavaScript
+const seq = [1, 2, 3, 4];
+const twice = seq.map(i => i * 2);
+```
+
+Here ``map`` is a *member* of ``seq``, despite the concept of "mapping" being
+entirely abstract.
+
+In many languages, when new sequence types are needed, they may be defined, but
+can suffer from performance penalties, but even worse: The algorithms are gone!
+The algorithm methods need to be re-implemented again on the new types.
+
+The C++ standard library instead opts for generic free functions. These have
+great benefits, including supporting containers of disparate types:
+
+```c++
+QList<int> integers = get_integers();
+vector<int> twice;
+transform(begin(integers), end(integers), back_inserter(twice), double_values);
+```
+
+Much of the standard library accepts "iterator pairs" as their representation of
+a sequence. This has some benefits, such as the algorithms not *needing* to
+known anything about the underlying contain. This also has some drawbacks,
+such as algorithms not *being able* to know anything about the underlying
+container.
+
+One of the biggest drawbacks, though, is the simple verbosity. We do not often
+write application code dealing strictly with iterator pairs. Instead, we'll be
+using actual concrete data structures that *expose* the iterator pairs that we
+hand to algorithms.
+
+Amongst many other things, the Ranges TS defines new overloads for many of the
+standard algorithms that accept "Range" types which present iterator pairs (or
+an iterator and a sentinel, but that isn't relevant).
+
+```c++
+QList<int> integers = get_integers();
+vector<int> twice;
+transform(integers, back_inserter(twice), double_values);
+```
+
+That's handy, and soon we will see the range-operating algorithms deployed in
+standard libraries everywhere.
+
+Another idea heavily pursued by the Ranges TS is *composition* of algorithms.
+
+Here I will borrow one of the most compelling examples from the ranges-v3
+library: The calendar printing example. I will start with a **very uglified**
+version of the example's apex, ``format_calendar``:
+
+```c++
+template <typename Calendar>
+auto format_calendar(size_t months_per_line, Calendar&& cal) {
+    // Group the dates by month
+    auto months = by_month(cal);
+    // Format the months into a range of strings
+    auto month_strings = layout_months(months);
+    // Group the months that belong side-by-side
+    auto chunked_months = chunk(month_strings, months_per_line);
+    // Transpose the rows and columns of side-by-side months
+    auto transposed = transpose_months(chunked_months);
+    // Ungroup the side-by-side months
+    auto joined_view = view::join(transposed);
+    // Join the strings of the transposed months
+    return join_months(joined_view);
+}
+```
+
+This code is not inscrutable, but it is far from what the original looked like.
+We have a several variables that are essentially meaningless, as their names
+are tautological to the spelling of their initializing expression. And because
+these variables are only used in the immediately following line, we may as well
+place each variable's initializer in place of the variable name in the following
+call. The result is horrific, to say the least:
+
+```c++
+template <typename Calendar>
+auto format_calendar(size_t months_per_line, Calendar&& cal) {
+    // Join the strings of the transposed months
+    return join_months(
+        // Ungroup the side-by-side months
+        view::join(
+            // Transpose the rows and columns of side-by-side months
+            transpose_months(
+                // Group the months that belong side-by-side
+                chunk(
+                    // Format the months into a range of strings
+                    layout_months(
+                        // Group the dates by month
+                        by_month(cal)
+                    ),
+                    months_per_line
+                )
+            )
+        )
+    );
+}
+```
+
+(My favorite feature of the above horror is the ``months_per_line`` appearing
+quite distant from the function call to which it is an argument.)
+
+While the code is frightening, it is conceptually equivalent to the prior
+example. Both of these examples are very dissimilar to the code found in the
+range-v3 example upon which they were based.
+
+Ranges also seeks to tackle the above problem with the idea of *pipeable*
+objects.
+
+Pipeline-style is an increasingly popular way to write code, especially in
+functional programming languages. Ranges provides pipeline style via overloading
+of the bitwise-or ``|`` binary operator. In the pipeline style, the value on
+the left of the "pipeline" operator is conceptually "fed into" the expression
+on the right, where the right-hand-side is some "partial" expression missing
+the primary argument on which it operates. The actual example from range-v3
+uses this syntax to produce the much more concise and readable pipeline style:
+
+```c++
+auto
+format_calendar(std::size_t months_per_line)
+{
+    return make_pipeable([=](auto &&rng) {
+        using Rng = decltype(rng);
+        return std::forward<Rng>(rng)
+               // Group the dates by month:
+               | by_month()
+               // Format the month into a range of strings:
+               | layout_months()
+               // Group the months that belong side-by-side:
+               | chunk(months_per_line)
+               // Transpose the rows and columns of the size-by-side months:
+               | transpose_months()
+               // Ungroup the side-by-side months:
+               | view::join
+               // Join the strings of the transposed months:
+               | join_months();
+    });
+}
+```
+
+Usage of ``format_calendar`` also makes use of the "pipeline" syntax:
+
+```c++
+copy(dates(start_date, end_state) | format_calendar(3),
+     calendar_lines);
+```
+
+Where ``dates`` lazily generates date objects which are fed into the
+``format_calendar`` algorithm.
+
+Although the above examples use ranges, the pipeline style can be applied to
+any type of objects, from integers to strings to database rows.
+
+
+## Supporting ``|`` as an Pipeline Operator ## {#ovr.operator}
+
+How does ``|`` work in the above examples, and with Ranges in general? After
+all, it's just the bitwise-or operator. The "pipeline" semantics aren't built
+into the language.
+
+The answer, of course, is to use operator overloading. To support
+``transform(rng, projection)`` and ``rng | transform(project)``, the
+``transform`` name does not correspond to a single function. It must instead
+name an overload set (or a single object with multiple ``operator()``
+overloads). The type returned by the two overloads is radically different. The
+partially-applied form intended for use with ``|`` stores its argument in an
+object which defines the overloaded ``operator|``. If a range is given as the
+left-hand operand of the ``|`` operator, only then is the algorithm
+fully-applied and ready to produce results.
+
+If the left-hand operand of ``|`` is not a range but another partially-applied
+algorithm, the operator must produce a *new* partially-applied composition of
+the left and right operands.
+
+
+## Problems with ``|`` as a Pipeline Operator ## {#ovr.operator-problems}
+
+There are several drawbacks to using ``|`` for pipeline semantics:
+
+- The code required to support using ``|`` functionality is not simple. It adds
+    overhead during compilation, and without the aide of the inliner and basic
+    optimizations it can be incredibly expensive at runtime.
+- Defining new range algorithms necessitates opting-in to this machinery.
+    Existing code cannot make use of pipeline style.
+- Supporting both pipeline style and immediate style requires algorithms to
+    provide both partial and full algorithm implementations, where the partial
+    implementation is mostly boilerplate to generate the partially applied
+    closure object.
+
+All of the above can be fixed, the implementation of Ranges can be made simpler,
+with the addition of a new infix operator that I will refer to as the
+*pipeline-rewrite* operator.
+
+
+# Rewriting Pipelines with a ``|>`` Operator # {#operator}
+
+To set the stage, we will talk about what ``|>`` *is not*:
+
+- ``|>`` is not overloadable.
+- ``|>`` does not produce additional function calls or (abstract) machine code.
+- ``|>`` is not UFCS.
+
+Unlike [[p1282r0]], where ``|>`` is defined as a new token given as an operator
+with no built-in semantics (only for library authors to overload), this paper
+takes the direct opposite approach and proposes that ``|>`` be given fixed
+and un-customizable semantics. This may sound overly restricting, but the
+restrictions are necessary to provide the ``|>`` semantics.
+
+Much like [[p1282r0]], ``|>`` **is not UFCS!**
+
+
+## What it Does ## {#operator.what-do}
+
+The semantics of ``|>`` are incredibly simple yet surprisingly powerful. In
+short, the ``|>`` "rewrites" code written in a pipeline style:
+
+```c++
+expression |> function_call(a, b, c);
+```
+
+and produces the equivalent immediate style:
+
+```c++
+function_call(expression, a, b, c)
+```
+
+This rewriting of pipeline-style is why the name "pipeline-rewrite" was chosen.
+
+Note: The ``|>`` operator **does not** operate on the ``expression`` on the
+left and ``return-value`` of call on the right: It operates directly on the
+function call syntax itself.
+
+
+### Some Examples ### {#operator.examples}
+
+#### Using ``copy`` #### {#example.copy}
+
+Let's look at a non-lazy ``copy`` function:
+
+```c++
+template <typename Range, typename Output>
+auto copy(Range&& rng, Output out) {
+    for (const auto& item : std::forward<Range>(rng)) {
+        *out++ = item;
+    }
+    return out;
+}
+```
+
+This function operates on a range as its first argument, and an output iterator
+as its second argument. Usage is very simple:
+
+```c++
+std::vector<int> copies;
+auto integers = get_integers();
+copy(integers, back_inserter(copies));
+```
+
+We can elide the extraneous ``integers`` variable to shrink the code:
+
+```c++
+std::vector<int> copies;
+copy(get_integers(), back_inserter(copies));
+```
+
+We may want to use pipeline syntax to perform the copy. Instead of using ``|``
+for the pipeline style, we just use ``|>``. That would look like this:
+
+```c++
+std::vector<int> copies;
+get_integers() |> copy(back_inserter(copies));
+```
+
+To make our ``copy`` algorithm work with the ``|>`` operator, we need to write
+this additional code:
+
+```c++
+// (This space intentionally left blank)
+```
+
+That's right! Nothing at all!
+
+Remember that the semantics of ``|>`` will *rewrite* the code:
+
+```c++
+// This:
+get_integers() |> copy(back_inserter(copies));
+// becomes this:
+copy(get_integers(), back_inserter(copies));
+```
+
+That is, using ``|>`` is equivalent to the code not using the pipeline style.
+
+
+#### ``transform`` #### {#example.transform}
+
+One of the most fundamental algorithms is ``transform``. It applies a
+projection function to each element of the input range and yields the result of
+that projection.
+
+```c++
+template <typename Range, typename Proj>
+struct __transform_view {
+    // ...
+};
+
+template <typename Range, typename Proj, typename Out>
+auto transform(Range&& rng, Proj&& fn) {
+    return __transform_view(rng, fn);
+}
+```
+
+This algorithm is a *lazy* version of ``transform``. It will apply the
+projection function to elements of ``rng`` as iterators on the
+``__transform_view`` object are advanced.
+
+Range algorithms compose. We can use this with ``copy`` to make a meaningful
+program:
+
+```c++
+copy(transform(get_words(), make_uppercase), ostream_iterator<string>{cout, "\n"});
+```
+
+This code, of course, is inside-out from how evaluation is ordered. We can feed
+the result of ``transform`` into ``copy`` using ``|>``:
+
+```c++
+transform(get_words(), make_uppercase)
+  |> copy(ostream_iterator<string>{cout, "\n"});
+```
+
+And, without writing any additional support code, we can use ``|>`` to feed
+``get_words`` into ``transform``:
+
+```c++
+get_words()
+  |> transform(make_uppercase)
+  |> copy(ostream_iterator<string>{cout, "\n"});
+```
+
+
+#### A New Algorithm: ``each_as`` #### {#example.new-algo}
+
+Ranges will be receiving a function template ``to`` that creates a concrete
+range from another range. A very primitive implementation of one overload might
+look like this:
+
+```c++
+template <typename Container, typename Range>
+Container to(const Range& rng) {
+    Container ret(rng.begin(), rng.end());
+    return ret;
+}
+```
+
+This simply takes a range and uses it to fill a container with the
+iterator-pair constructor present on many container types. Usage looks like
+this:
+
+```c++
+auto filenames = get_strings()
+    |> to<vector<filesystem::path>>()
+    |> transform(get_filename)
+    |> to<vector<string>>();
+```
+
+However: The ``to`` algorithm, unlike ``transform``, is *eager*. It consumes
+each element of the input immediately. This requires a concrete new container
+type that will eagerly allocate a buffer to hold the new objects. In the above
+snippet, all we are doing is obtaining the filenames of each file, and we do
+not actually care about the intermediate ``std::vector``.
+
+Note: The above example is illustrative. There are other ways to perform the
+necessary transform.
+
+What we may want it a new lazy algorithm that simply converts each range
+element to a new type as they pass through. How could we define such an
+algorithm?
+
+```c++
+template <typename T, typename Range>
+auto each_as(Range&& rng) {
+    return rng |> transform([](const auto& item) { return T(item); });
+}
+```
+
+With `|>` at our disposal, there is no need to offer two overloads of
+``each_as`` for the two styles. The above overload happily works with ``|>``
+pipeline style:
+
+```c++
+auto filenames = get_strings()
+    |> each_as<filesystem::path>()
+    |> transform(get_filename)
+    |> to<vector<string>>();
+```
+
+Or non-pipeline style:
+
+```c++
+auto filenames =
+    each_as<filesystem::path>(get_strings())
+    |> transform(get_filename)
+    |> to<vector<string>>();
+```
+
+
+#### A New Algorithm: ``copy_insert``/``copy_extend`` #### {#example.onto-end}
+
+A common operation is to collect the results of multiple computations into a
+single container. We can define two new algorithms:
+
+```c++
+template <typename Range, typename Container, typename Iter>
+void copy_insert(Range&& rng, Container& c, Iter it) {
+    rng |> copy(inserter(c, it));
+}
+
+template <typename Range, typename Container>
+void copy_extend(Range&& rng, Container& c) {
+    rng |> copy_insert(c, c.end());
+}
+```
+
+Again, we have ``|>`` syntax using normal functions and no special return types
+or expression templates.
+
+Using them is very simple:
+
+```c++
+// We may use pipeline style:
+void collect_filenames(filesystem::path dirpath, vector<string>& fnames) {
+    filesystem::directory_iterator{dirpath}
+        |> copy_extend(fnames);
+}
+
+// Or we may use classical style:
+void collect_filenames(filesystem::path dirpath, vector<string>& fnames) {
+    copy_extend(
+      filesystem::directory_iterator{dirpath},
+      fnames
+    );
+}
+```
